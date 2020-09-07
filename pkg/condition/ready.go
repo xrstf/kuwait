@@ -56,8 +56,8 @@ type objectWithConditions struct {
 
 func (o *objectWithConditions) hasCondition(name string, status string) bool {
 	for _, cond := range o.Status.Conditions {
-		if strings.ToLower(cond.Type) == strings.ToLower(name) {
-			return strings.ToLower(cond.Status) == strings.ToLower(status)
+		if strings.EqualFold(cond.Type, name) {
+			return strings.EqualFold(cond.Status, status)
 		}
 	}
 
