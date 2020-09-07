@@ -1,29 +1,43 @@
 package main
 
 import (
-	"errors"
+	"context"
 	"flag"
 	"fmt"
-	"strings"
+	"os"
+	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
+	"go.xrstf.de/kuwait/pkg/condition"
+	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/discovery"
+	memory "k8s.io/client-go/discovery/cached"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/restmapper"
 	"k8s.io/client-go/tools/clientcmd"
+	"sigs.k8s.io/controller-runtime/pkg/manager/signals"
 )
 
 type options struct {
 	kubeconfig string
 	timeout    time.Duration
+	interval   time.Duration
 	debugLog   bool
 }
 
 func main() {
 	opt := options{
-		timeout: 10 * time.Minute,
+		timeout:  10 * time.Minute,
+		interval: 1 * time.Second,
 	}
 
 	flag.StringVar(&opt.kubeconfig, "kubeconfig", opt.kubeconfig, "kubeconfig file to use")
 	flag.DurationVar(&opt.timeout, "timeout", opt.timeout, "maximum time to wait for all conditions to be met")
+	flag.DurationVar(&opt.interval, "interval", opt.interval, "time inbetween status checks")
 	flag.BoolVar(&opt.debugLog, "debug", opt.debugLog, "enable more verbose logging")
 	flag.Parse()
 
@@ -39,20 +53,19 @@ func main() {
 	}
 
 	// validate CLI flags
-	targetArgs := flag.Args()
-	if len(targetArgs) == 0 {
-		log.Fatal("No targets to wait for given.")
+	conditionArgs := flag.Args()
+	if len(conditionArgs) == 0 {
+		log.Fatal("No conditions to wait for given.")
 	}
 
-	targets := []target{}
-	for _, target := range targetArgs {
-		t, err := parseTarget(target)
-		if err != nil {
-			log.Fatalf("Invalid target %q: %v", target, err)
-		}
-
-		targets = append(targets, t)
-	}
+	// setup signal handler
+	stopCh := signals.SetupSignalHandler()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		<-stopCh
+		cancel()
+	}()
 
 	// setup kubernetes client
 	config, err := clientcmd.BuildConfigFromFlags("", opt.kubeconfig)
@@ -60,78 +73,91 @@ func main() {
 		log.Fatalf("Failed to create Kubernetes client: %v", err)
 	}
 
-	fmt.Println(config.String())
-}
-
-type target struct {
-	kind      string
-	namespace string
-	name      string
-	condition string
-}
-
-const (
-	KindNamespace   = "namespace"
-	KindPod         = "pod"
-	KindDaemonSet   = "daemonset"
-	KindStatefulSet = "statefulset"
-	KindDeployment  = "deployment"
-)
-
-func parseTarget(t string) (target, error) {
-	result := target{}
-
-	parts := strings.Split(t, "/")
-	if len(parts) < 4 {
-		return result, errors.New("must be in `kind/namespace/name/condition` format")
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		log.Fatalf("Failed to create Kubernetes clientset: %v", err)
 	}
 
-	result.kind = strings.ToLower(parts[0])
-	result.namespace = parts[1]
-	result.name = parts[2]
-	result.condition = parts[3]
+	log.Debug("Creating REST mapper...")
 
-	switch result.kind {
-	case "pod":
-		fallthrough
-	case "pods":
-		result.kind = KindPod
-
-	case "namespace":
-		fallthrough
-	case "namespaces":
-		fallthrough
-	case "ns":
-		result.kind = KindNamespace
-
-	case "daemonset":
-		fallthrough
-	case "daemonsets":
-		fallthrough
-	case "ds":
-		result.kind = KindDaemonSet
-
-	case "statefulset":
-		fallthrough
-	case "statefulsets":
-		fallthrough
-	case "sts":
-		fallthrough
-	case "ss":
-		result.kind = KindStatefulSet
-
-	case "deployment":
-		fallthrough
-	case "deployments":
-		fallthrough
-	case "dep":
-		fallthrough
-	case "deps":
-		result.kind = KindDeployment
-
-	default:
-		return result, fmt.Errorf("unknown kind %q given", result.kind)
+	mapper, err := getRESTMapper(config)
+	if err != nil {
+		log.Fatalf("Failed to create Kubernetes REST mapper: %v", err)
 	}
 
-	return result, nil
+	dynamicClient, err := dynamic.NewForConfig(config)
+	if err != nil {
+		log.Fatalf("Failed dynamic.NewForConfig: %v", err)
+	}
+
+	log.Debug("Parsing conditions...")
+
+	conditions := []condition.Condition{}
+	for _, conditionArg := range conditionArgs {
+		cond, err := condition.Parse(conditionArg, clientset, dynamicClient, mapper)
+		if err != nil {
+			log.Fatalf("Invalid condition %q: %v", conditionArg, err)
+		}
+
+		log.Debugf("Condition: %v", cond)
+
+		conditions = append(conditions, cond)
+	}
+
+	// start timeout
+	to, tocancel := context.WithTimeout(ctx, 5*time.Second)
+	defer tocancel()
+
+	log.Infof("Waiting %v for the following conditions to be met:", opt.timeout)
+	for _, condition := range conditions {
+		log.Info(condition.String())
+	}
+
+	// start goroutine per condition
+	wg := sync.WaitGroup{}
+	success := true
+	for i := range conditions {
+		wg.Add(1)
+		go func(condition condition.Condition) {
+			if err := waiter(to, log, condition, opt.interval); err != nil {
+				log.Error(err)
+				success = false
+			}
+
+			wg.Done()
+		}(conditions[i])
+	}
+
+	wg.Wait()
+
+	if success {
+		log.Info("All conditions are met.")
+	} else {
+		os.Exit(1)
+	}
+}
+
+func waiter(ctx context.Context, log logrus.FieldLogger, condition condition.Condition, interval time.Duration) error {
+	err := wait.PollUntil(interval, func() (bool, error) {
+		return condition.Satisfied(ctx)
+	}, ctx.Done())
+
+	if err == wait.ErrWaitTimeout || err == context.DeadlineExceeded {
+		return fmt.Errorf("Condition was not met after timeout: %s", condition)
+	}
+
+	return err
+}
+
+func getRESTMapper(config *rest.Config) (meta.RESTMapper, error) {
+	discoveryClient, err := discovery.NewDiscoveryClientForConfig(config)
+	if err != nil {
+		return nil, err
+	}
+
+	cache := memory.NewMemCacheClient(discoveryClient)
+	mapper := restmapper.NewDeferredDiscoveryRESTMapper(cache)
+	fancyMapper := restmapper.NewShortcutExpander(mapper, discoveryClient)
+
+	return fancyMapper, nil
 }
