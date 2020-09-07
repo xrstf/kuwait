@@ -9,7 +9,9 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
+
 	"go.xrstf.de/kuwait/pkg/condition"
+
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/discovery"
@@ -19,7 +21,6 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/restmapper"
 	"k8s.io/client-go/tools/clientcmd"
-	"sigs.k8s.io/controller-runtime/pkg/manager/signals"
 )
 
 type options struct {
@@ -57,15 +58,6 @@ func main() {
 	if len(conditionArgs) == 0 {
 		log.Fatal("No conditions to wait for given.")
 	}
-
-	// setup signal handler
-	stopCh := signals.SetupSignalHandler()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() {
-		<-stopCh
-		cancel()
-	}()
 
 	// setup kubernetes client
 	config, err := clientcmd.BuildConfigFromFlags("", opt.kubeconfig)
@@ -105,7 +97,7 @@ func main() {
 	}
 
 	// start timeout
-	to, tocancel := context.WithTimeout(ctx, 5*time.Second)
+	to, tocancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer tocancel()
 
 	log.Infof("Waiting %v for the following conditions to be met:", opt.timeout)
